@@ -101,8 +101,10 @@ the true original. Jobs that were loaded are reloaded; unloaded jobs stay unload
 
 - **Don't move or delete the launcher folder** — the jobs point at those files.
 - **Third-party jobs:** you *can* rename them, but app updates (and `brew services`) may rewrite
-  their plists, and some privileged helpers verify their own code signature. `bgname` is aimed at
-  jobs you own; for vendor jobs, it's usually better to leave them alone.
+  their plists, and some privileged helpers verify their own code signature. Some apps reinstall
+  their job every time they launch, silently undoing the rename. `bgname` is aimed at jobs you own;
+  for vendor jobs, it's usually better to leave them alone. If an app did rewrite its job,
+  `bgname restore` still cleans up the leftover launcher.
 - macOS may keep showing old entries until you reopen System Settings, and may post a
   "Background Items Added" notification for each renamed job. Both are normal.
 - The name must not contain `/`, quotes, or backslashes, or start with a dot.

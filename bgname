@@ -10,7 +10,7 @@
 # https://github.com/nucoles85/bgname — MIT License
 set -eo pipefail
 
-VERSION=1.0.2
+VERSION=1.0.3
 MIN_MACOS=26   # supported: macOS 26 (Tahoe) and later; built and tested on macOS 27.2
 PROG=${0##*/}
 MARKER='# bgname-label:'
@@ -241,7 +241,7 @@ cmd_rename() {
 
 cmd_restore() {
   [ $# -ge 1 ] || usage 2
-  local f label ldir backup was=0 current
+  local f label ldir backup was=0 current l
   f=$(find_plist "$1") || die "no launchd plist found for '$1'"
   label=$(pl "$f" Label) || die "$f has no Label"
   ldir=$(launcher_dir "$f")
@@ -253,6 +253,11 @@ cmd_restore() {
   cp "$backup" "$f"
   reload "$f" "$label" "$was"
   if [ -n "$current" ] && [ "$(launcher_label "$current")" = "$label" ]; then rm -f "$current"; fi
+  # Also remove launchers for this label that the plist no longer points at
+  # (e.g. an app rewrote its own plist after the rename).
+  for l in "$ldir"/*; do
+    [ -f "$l" ] && [ "$(launcher_label "$l")" = "$label" ] && rm -f "$l"
+  done
   rm -f "$backup"
   echo "$label restored to its original command"
   show_status "$f" "$label"
