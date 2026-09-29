@@ -10,7 +10,7 @@
 # https://github.com/nucoles85/bgname — MIT License
 set -eo pipefail
 
-VERSION=1.0.1
+VERSION=1.0.2
 MIN_MACOS=26   # supported: macOS 26 (Tahoe) and later; built and tested on macOS 27.2
 PROG=${0##*/}
 MARKER='# bgname-label:'
@@ -112,8 +112,10 @@ read_cmd() {
   [ ${#CMD[@]} -gt 0 ]
 }
 
-launcher_label() { [ -f "$1" ] && sed -n "s/^$MARKER //p" "$1" | head -1 || true; }
-launcher_cmd()   { [ -f "$1" ] && sed -n 's/^exec \(.*\) "\$@"$/\1/p' "$1" | head -1 || true; }
+# Launchers are small text files; only read the start, byte-wise, so binaries are safe to probe.
+launcher_head()  { [ -f "$1" ] && head -c 4096 "$1" | LC_ALL=C tr -d '\000' || true; }
+launcher_label() { launcher_head "$1" | LC_ALL=C sed -n "s/^$MARKER //p" | head -1 || true; }
+launcher_cmd()   { launcher_head "$1" | LC_ALL=C sed -n 's/^exec \(.*\) "\$@"$/\1/p' | head -1 || true; }
 
 quote_cmd() {
   local out= a
