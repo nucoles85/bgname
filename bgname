@@ -10,7 +10,8 @@
 # https://github.com/nucoles85/bgname — MIT License
 set -eo pipefail
 
-VERSION=1.0.0
+VERSION=1.0.1
+MIN_MACOS=26   # supported: macOS 26 (Tahoe) and later; built and tested on macOS 27.2
 PROG=${0##*/}
 MARKER='# bgname-label:'
 GENERIC_RE='^((ba|z|da|k|c|tc|fi)?sh|env|python[0-9.]*|pythonw|ruby[0-9.]*|perl[0-9.]*|node|deno|bun|php[0-9.]*|java|osascript|Rscript|lua[0-9.]*|uv|npx|npm)$'
@@ -50,6 +51,16 @@ EOF
 
 die()  { echo "$PROG: $*" >&2; exit 1; }
 note() { echo "$PROG: $*" >&2; }
+
+check_macos() {
+  local v major
+  [ "$(uname -s)" = Darwin ] || die "bgname only works on macOS"
+  v=$(sw_vers -productVersion 2>/dev/null) || return 0
+  major=${v%%.*}
+  if [ "$major" -lt "$MIN_MACOS" ] 2>/dev/null; then
+    note "warning: bgname supports macOS $MIN_MACOS and later; this Mac runs $v (untested)"
+  fi
+}
 
 # The invoking user, even under sudo.
 user_uid()  { echo "${SUDO_UID:-$(id -u)}"; }
@@ -284,7 +295,14 @@ cmd_create() {
   write_launcher "$launcher" "$label" "$sys" "$@"
 
   mkdir -p "$(dirname "$f")"
-  plutil -create xml1 "$f"
+  # Plain XML skeleton rather than `plutil -create`, which older macOS releases lack.
+  cat >"$f" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict/>
+</plist>
+XML
   plutil -insert Label -string "$label" "$f"
   plutil -insert ProgramArguments -json "[\"$launcher\"]" "$f"
   [ $rat = 1 ] && plutil -insert RunAtLoad -bool true "$f"
@@ -313,11 +331,15 @@ cmd_create() {
 }
 
 case "$1" in
+  list | rename | restore | create) check_macos ;;
+esac
+
+case "$1" in
   list) shift; cmd_list "$@" ;;
   rename) shift; cmd_rename "$@" ;;
   restore) shift; cmd_restore "$@" ;;
   create) shift; cmd_create "$@" ;;
-  -v | --version) echo "bgname $VERSION" ;;
+  -v | --version) echo "bgname $VERSION (macOS $MIN_MACOS+)" ;;
   '' | -h | --help | help) usage ;;
   *) note "unknown command '$1'"; usage 2 ;;
 esac

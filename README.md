@@ -2,6 +2,8 @@
 
 **Give macOS background items meaningful names.**
 
+![macOS 26+](https://img.shields.io/badge/macOS-26%20Tahoe%20and%20later-blue) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 System Settings → General → Login Items & Extensions → **Background App Activity** labels each
 launchd job with the file name of the program it starts. Any job that runs a script through an
 interpreter shows up with a useless name:
@@ -33,6 +35,23 @@ install -m 755 bgname /usr/local/bin/bgname   # or symlink it into any folder on
 ```
 
 No dependencies — just `bash`, `plutil` and `launchctl`, which ship with macOS.
+
+## Compatibility
+
+| | |
+|---|---|
+| **Built and tested on** | macOS 27.2 (build 26B5091g), Apple silicon |
+| **Supported** | macOS 26 (Tahoe) and later, Apple silicon and Intel |
+| **Shell** | the system `/bin/bash` 3.2 — no Homebrew bash needed |
+
+`bgname` sticks to features that all predate macOS 26: bash 3.2 syntax,
+`plutil -extract … raw` / `-insert` / `-replace` / `-remove` / `-lint`, and
+`launchctl bootstrap` / `bootout` / `print`. It deliberately avoids newer conveniences such as
+`plutil -create`. On a release older than macOS 26 it still runs but prints a warning, since
+those releases aren't tested.
+
+The **Background App Activity** list lives under System Settings → General →
+Login Items & Extensions on macOS 26 and later.
 
 ## Usage
 
