@@ -1,0 +1,323 @@
+#!/bin/bash
+# bgname — give macOS background items (launchd jobs) meaningful names.
+#
+# System Settings > General > Login Items & Extensions > Background App Activity
+# labels each launchd job with the file name of the executable it starts, so any
+# job that starts an interpreter shows up as "bash", "python3", "node", ...
+# bgname points the job at a small launcher named after what the job does; the
+# launcher exec's the original command unchanged.
+#
+# https://github.com/nucoles85/bgname — MIT License
+set -eo pipefail
+
+VERSION=1.0.0
+PROG=${0##*/}
+MARKER='# bgname-label:'
+GENERIC_RE='^((ba|z|da|k|c|tc|fi)?sh|env|python[0-9.]*|pythonw|ruby[0-9.]*|perl[0-9.]*|node|deno|bun|php[0-9.]*|java|osascript|Rscript|lua[0-9.]*|uv|npx|npm)$'
+
+usage() {
+  cat <<EOF
+bgname $VERSION — give macOS background items (launchd jobs) meaningful names
+
+Usage:
+  $PROG list [--all]
+      Show launchd jobs that appear under a generic name (bash, python3, node, ...)
+      and jobs already renamed by bgname. --all shows every job.
+
+  $PROG rename <label|plist> "<Name>" [--dry-run]
+      Make an existing job appear as <Name>. Also renames a bgname launcher again.
+
+  $PROG restore <label|plist>
+      Undo a rename: put the original plist back and remove the launcher.
+
+  $PROG create --label <label> --name "<Name>" [options] -- <command> [args...]
+      Create and load a new launchd job that appears as <Name>.
+        --interval <seconds>   run every N seconds (StartInterval)
+        --at <HH:MM>           run daily at this time; repeatable (StartCalendarInterval)
+        --keep-alive           restart the job whenever it exits
+        --no-run-at-load       don't run immediately when loaded
+        --workdir <dir>        working directory
+        --log <file>           send stdout and stderr to this file
+        --system               create a LaunchDaemon (runs as root; needs sudo)
+
+Jobs in ~/Library/LaunchAgents are handled without sudo; jobs in /Library need sudo.
+Launchers live in ~/Library/Scripts/Background Jobs/ (per user) or
+/usr/local/libexec/Background Jobs/ (system, root-owned). Original plists are kept
+in a .backups folder next to the launchers.
+EOF
+  exit "${1:-0}"
+}
+
+die()  { echo "$PROG: $*" >&2; exit 1; }
+note() { echo "$PROG: $*" >&2; }
+
+# The invoking user, even under sudo.
+user_uid()  { echo "${SUDO_UID:-$(id -u)}"; }
+user_home() { if [ -n "$SUDO_USER" ]; then eval echo "~$SUDO_USER"; else echo "$HOME"; fi; }
+
+plist_dirs() { printf '%s\n' "$(user_home)/Library/LaunchAgents" /Library/LaunchAgents /Library/LaunchDaemons; }
+
+is_system_plist() { case "$1" in /Library/*) return 0 ;; *) return 1 ;; esac; }
+
+launcher_dir() {
+  if is_system_plist "$1"; then echo "/usr/local/libexec/Background Jobs"
+  else echo "$(user_home)/Library/Scripts/Background Jobs"; fi
+}
+
+domain_for() {
+  case "$1" in /Library/LaunchDaemons/*) echo system ;; *) echo "gui/$(user_uid)" ;; esac
+}
+
+pl() { plutil -extract "$2" raw -o - "$1" 2>/dev/null; }
+
+find_plist() {
+  local arg=$1 d f
+  if [ -f "$arg" ]; then echo "$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"; return 0; fi
+  while IFS= read -r d; do
+    if [ -f "$d/$arg.plist" ]; then echo "$d/$arg.plist"; return 0; fi
+  done < <(plist_dirs)
+  while IFS= read -r d; do
+    for f in "$d"/*.plist; do
+      [ -f "$f" ] || continue
+      if [ "$(pl "$f" Label)" = "$arg" ]; then echo "$f"; return 0; fi
+    done
+  done < <(plist_dirs)
+  return 1
+}
+
+# Sets CMD to the command the job runs (honouring Program vs ProgramArguments).
+read_cmd() {
+  local f=$1 n i prog
+  CMD=(); ARGV=()
+  n=$(pl "$f" ProgramArguments) || n=0
+  for ((i = 0; i < n; i++)); do ARGV[i]=$(pl "$f" "ProgramArguments.$i"); done
+  prog=$(pl "$f" Program) || prog=
+  if [ -n "$prog" ]; then
+    CMD=("$prog")
+    for ((i = 1; i < n; i++)); do CMD+=("${ARGV[i]}"); done
+  else
+    CMD=("${ARGV[@]}")
+  fi
+  [ ${#CMD[@]} -gt 0 ]
+}
+
+launcher_label() { [ -f "$1" ] && sed -n "s/^$MARKER //p" "$1" | head -1 || true; }
+launcher_cmd()   { [ -f "$1" ] && sed -n 's/^exec \(.*\) "\$@"$/\1/p' "$1" | head -1 || true; }
+
+quote_cmd() {
+  local out= a
+  for a in "$@"; do out+=" $(printf %q "$a")"; done
+  echo "${out# }"
+}
+
+check_name() {
+  case "$1" in
+    '' | .* | */* | *'"'* | *'\'*) die "invalid name '$1' (no /, quotes, backslashes or leading dot)" ;;
+  esac
+}
+
+need_write() {
+  if is_system_plist "$1"; then
+    [ "$EUID" -eq 0 ] || die "$1 is system-level; re-run with sudo"
+  else
+    [ "$EUID" -ne 0 ] || die "$1 belongs to your user account; run without sudo"
+  fi
+}
+
+write_launcher() {
+  local path=$1 label=$2 sys=$3
+  shift 3
+  mkdir -p "$(dirname "$path")"
+  {
+    echo '#!/bin/bash'
+    echo '# Launcher created by bgname so macOS Background App Activity shows a meaningful name.'
+    echo "$MARKER $label"
+    echo "# Undo with: bgname restore $label"
+    echo "exec $(quote_cmd "$@") \"\$@\""
+  } >"$path.tmp.$$"
+  chmod 755 "$path.tmp.$$"
+  [ "$sys" = 1 ] && chown root:wheel "$path.tmp.$$"
+  mv "$path.tmp.$$" "$path"
+}
+
+is_loaded() { launchctl print "$(domain_for "$1")/$2" >/dev/null 2>&1; }
+
+reload() {
+  local f=$1 label=$2 was=$3 d i
+  if [ "$was" != 1 ]; then note "$label was not loaded; leaving it unloaded"; return 0; fi
+  d=$(domain_for "$f")
+  launchctl bootout "$d/$label" 2>/dev/null || true
+  for i in 1 2 3 4 5; do is_loaded "$f" "$label" || break; sleep 1; done
+  launchctl bootstrap "$d" "$f"
+}
+
+show_status() {
+  launchctl print "$(domain_for "$1")/$2" 2>/dev/null | grep -E '^\s(state|program|last exit code) =' || true
+}
+
+cmd_list() {
+  local all=0 d f label exe status shows cmdtxt
+  [ "$1" = --all ] && all=1
+  printf '%-9s %-32s %-44s %s\n' STATUS "SHOWS AS" LABEL COMMAND
+  while IFS= read -r d; do
+    for f in "$d"/*.plist; do
+      [ -f "$f" ] || continue
+      label=$(pl "$f" Label) || continue
+      read_cmd "$f" || continue
+      exe=${CMD[0]##*/}
+      if [ -n "$(launcher_label "${CMD[0]}")" ]; then
+        status=renamed; cmdtxt=$(launcher_cmd "${CMD[0]}")
+      elif [[ $exe =~ $GENERIC_RE ]]; then
+        status=generic; cmdtxt=$(quote_cmd "${CMD[@]}")
+      else
+        [ $all = 1 ] || continue
+        status=ok; cmdtxt=$(quote_cmd "${CMD[@]}")
+      fi
+      shows=$exe
+      [ ${#cmdtxt} -gt 90 ] && cmdtxt="${cmdtxt:0:87}..."
+      printf '%-9s %-32s %-44s %s\n' "$status" "$shows" "$label" "$cmdtxt"
+    done
+  done < <(plist_dirs)
+}
+
+cmd_rename() {
+  [ $# -ge 2 ] || usage 2
+  local target=$1 name=$2 dry=0 f label ldir launcher owner sys=0 was=0 old
+  [ "$3" = --dry-run ] && dry=1
+  check_name "$name"
+  f=$(find_plist "$target") || die "no launchd plist found for '$target'"
+  label=$(pl "$f" Label) || die "$f has no Label"
+  read_cmd "$f" || die "$f has no Program/ProgramArguments"
+  is_system_plist "$f" && sys=1
+  ldir=$(launcher_dir "$f")
+  launcher="$ldir/$name"
+
+  owner=$(launcher_label "$launcher")
+  if [ -e "$launcher" ] && [ "$owner" != "$label" ]; then
+    die "'$launcher' already exists${owner:+ (used by $owner)}; pick another name"
+  fi
+
+  old=
+  if [ "$(launcher_label "${CMD[0]}")" = "$label" ]; then
+    old=${CMD[0]}
+    if [ "$old" = "$launcher" ]; then echo "$label already shows as '$name'"; return 0; fi
+  fi
+
+  if [ $dry = 1 ]; then
+    echo "plist:    $f"
+    echo "launcher: $launcher"
+    if [ -n "$old" ]; then echo "renames:  $old"; else echo "runs:     $(quote_cmd "${CMD[@]}")"; fi
+    return 0
+  fi
+
+  need_write "$f"
+  is_loaded "$f" "$label" && was=1
+  if [ -n "$old" ]; then
+    mv "$old" "$launcher"
+  else
+    mkdir -p "$ldir/.backups"
+    [ -e "$ldir/.backups/$label.plist" ] || cp -p "$f" "$ldir/.backups/$label.plist"
+    write_launcher "$launcher" "$label" "$sys" "${CMD[@]}"
+    plutil -remove Program "$f" >/dev/null 2>&1 || true
+  fi
+  plutil -replace ProgramArguments -json "[\"$launcher\"]" "$f"
+  reload "$f" "$label" "$was"
+  echo "$label now shows as '$name'"
+  show_status "$f" "$label"
+}
+
+cmd_restore() {
+  [ $# -ge 1 ] || usage 2
+  local f label ldir backup was=0 current
+  f=$(find_plist "$1") || die "no launchd plist found for '$1'"
+  label=$(pl "$f" Label) || die "$f has no Label"
+  ldir=$(launcher_dir "$f")
+  backup="$ldir/.backups/$label.plist"
+  [ -f "$backup" ] || die "no backup for $label at $backup"
+  need_write "$f"
+  read_cmd "$f" && current=${CMD[0]}
+  is_loaded "$f" "$label" && was=1
+  cp "$backup" "$f"
+  reload "$f" "$label" "$was"
+  if [ -n "$current" ] && [ "$(launcher_label "$current")" = "$label" ]; then rm -f "$current"; fi
+  rm -f "$backup"
+  echo "$label restored to its original command"
+  show_status "$f" "$label"
+}
+
+cmd_create() {
+  local label= name= interval= keep=0 rat=1 wd= log= sys=0 f ldir launcher exe t h m json
+  local -a ats=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --label) label=$2; shift 2 ;;
+      --name) name=$2; shift 2 ;;
+      --interval) interval=$2; shift 2 ;;
+      --at) ats+=("$2"); shift 2 ;;
+      --keep-alive) keep=1; shift ;;
+      --no-run-at-load) rat=0; shift ;;
+      --workdir) wd=$2; shift 2 ;;
+      --log) log=$2; shift 2 ;;
+      --system) sys=1; shift ;;
+      --) shift; break ;;
+      *) die "unknown option '$1' (put the command after --)" ;;
+    esac
+  done
+  [ -n "$label" ] && [ -n "$name" ] && [ $# -gt 0 ] || usage 2
+  [[ $label =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid label '$label'"
+  check_name "$name"
+  if [ -n "$interval" ] && ! [[ $interval =~ ^[0-9]+$ ]]; then die "--interval must be seconds"; fi
+
+  if [ $sys = 1 ]; then f=/Library/LaunchDaemons/$label.plist
+  else f="$(user_home)/Library/LaunchAgents/$label.plist"; fi
+  [ -e "$f" ] && die "$f already exists (use '$PROG rename' for existing jobs)"
+  need_write "$f"
+
+  exe=$1
+  if [[ $exe != /* ]]; then exe=$(command -v "$exe") || die "command not found: $1"; fi
+  shift
+  set -- "$exe" "$@"
+
+  ldir=$(launcher_dir "$f")
+  launcher="$ldir/$name"
+  [ -e "$launcher" ] && die "'$launcher' already exists; pick another name"
+  write_launcher "$launcher" "$label" "$sys" "$@"
+
+  mkdir -p "$(dirname "$f")"
+  plutil -create xml1 "$f"
+  plutil -insert Label -string "$label" "$f"
+  plutil -insert ProgramArguments -json "[\"$launcher\"]" "$f"
+  [ $rat = 1 ] && plutil -insert RunAtLoad -bool true "$f"
+  [ $keep = 1 ] && plutil -insert KeepAlive -bool true "$f"
+  [ -n "$interval" ] && plutil -insert StartInterval -integer "$interval" "$f"
+  if [ ${#ats[@]} -gt 0 ]; then
+    json=
+    for t in "${ats[@]}"; do
+      [[ $t =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || die "--at must be HH:MM, got '$t'"
+      h=$((10#${BASH_REMATCH[1]})); m=$((10#${BASH_REMATCH[2]}))
+      json+="{\"Hour\":$h,\"Minute\":$m},"
+    done
+    plutil -insert StartCalendarInterval -json "[${json%,}]" "$f"
+  fi
+  [ -n "$wd" ] && plutil -insert WorkingDirectory -string "$wd" "$f"
+  if [ -n "$log" ]; then
+    plutil -insert StandardOutPath -string "$log" "$f"
+    plutil -insert StandardErrorPath -string "$log" "$f"
+  fi
+  if [ $sys = 1 ]; then chown root:wheel "$f"; chmod 644 "$f"; fi
+  plutil -lint "$f" >/dev/null
+
+  launchctl bootstrap "$(domain_for "$f")" "$f"
+  echo "created $label ($f), shows as '$name'"
+  show_status "$f" "$label"
+}
+
+case "$1" in
+  list) shift; cmd_list "$@" ;;
+  rename) shift; cmd_rename "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  create) shift; cmd_create "$@" ;;
+  -v | --version) echo "bgname $VERSION" ;;
+  '' | -h | --help | help) usage ;;
+  *) note "unknown command '$1'"; usage 2 ;;
+esac
